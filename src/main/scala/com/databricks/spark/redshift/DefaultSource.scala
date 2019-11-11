@@ -16,7 +16,7 @@
 
 package com.databricks.spark.redshift
 
-import com.amazonaws.auth.AWSCredentials
+import com.amazonaws.auth.AWSCredentialsProvider
 import com.amazonaws.services.s3.AmazonS3Client
 import org.apache.spark.sql.sources.{BaseRelation, CreatableRelationProvider, RelationProvider, SchemaRelationProvider}
 import org.apache.spark.sql.types.StructType
@@ -26,13 +26,23 @@ import org.slf4j.LoggerFactory
 /**
  * Redshift Source implementation for Spark SQL
  */
-class DefaultSource(jdbcWrapper: JDBCWrapper, s3ClientFactory: AWSCredentials => AmazonS3Client)
+class DefaultSource(
+    jdbcWrapper: JDBCWrapper,
+    s3ClientFactory: AWSCredentialsProvider => AmazonS3Client)
   extends RelationProvider
   with SchemaRelationProvider
   with CreatableRelationProvider {
 
   private val log = LoggerFactory.getLogger(getClass)
 
+  def s3ClientFactoryFixed(provider:AWSCredentialsProvider):AmazonS3Client = {
+    val s3Client = s3ClientFactory(provider)
+      
+    val endpoint = Option( System.getProperty("fs.s3a.endpoint") )
+    endpoint.foreach(s3Client.setEndpoint(_))
+
+    s3Client
+  }
   /**
    * Default constructor required by Data Source API
    */
@@ -46,7 +56,7 @@ class DefaultSource(jdbcWrapper: JDBCWrapper, s3ClientFactory: AWSCredentials =>
       sqlContext: SQLContext,
       parameters: Map[String, String]): BaseRelation = {
     val params = Parameters.mergeParameters(parameters)
-    RedshiftRelation(jdbcWrapper, s3ClientFactory, params, None)(sqlContext)
+    RedshiftRelation(jdbcWrapper, s3ClientFactoryFixed, params, None)(sqlContext)
   }
 
   /**
@@ -57,7 +67,7 @@ class DefaultSource(jdbcWrapper: JDBCWrapper, s3ClientFactory: AWSCredentials =>
       parameters: Map[String, String],
       schema: StructType): BaseRelation = {
     val params = Parameters.mergeParameters(parameters)
-    RedshiftRelation(jdbcWrapper, s3ClientFactory, params, Some(schema))(sqlContext)
+    RedshiftRelation(jdbcWrapper, s3ClientFactoryFixed, params, Some(schema))(sqlContext)
   }
 
   /**
@@ -103,7 +113,7 @@ class DefaultSource(jdbcWrapper: JDBCWrapper, s3ClientFactory: AWSCredentials =>
 
     if (doSave) {
       val updatedParams = parameters.updated("overwrite", dropExisting.toString)
-      new RedshiftWriter(jdbcWrapper, s3ClientFactory).saveToRedshift(
+      new RedshiftWriter(jdbcWrapper, s3ClientFactoryFixed).saveToRedshift(
         sqlContext, data, saveMode, Parameters.mergeParameters(updatedParams))
     }
 

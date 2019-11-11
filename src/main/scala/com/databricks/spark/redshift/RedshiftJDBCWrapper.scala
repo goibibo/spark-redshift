@@ -26,6 +26,7 @@ import scala.collection.JavaConverters._
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration.Duration
 import scala.util.Try
+import scala.util.control.NonFatal
 
 import org.apache.spark.SPARK_VERSION
 import org.apache.spark.sql.execution.datasources.jdbc.DriverRegistry
@@ -124,7 +125,16 @@ private[redshift] class JDBCWrapper {
       op: PreparedStatement => T): T = {
     try {
       val future = Future[T](op(statement))(ec)
-      Await.result(future, Duration.Inf)
+      try {
+        Await.result(future, Duration.Inf)
+      } catch {
+        case e: SQLException =>
+          // Wrap and re-throw so that this thread's stacktrace appears to the user.
+          throw new SQLException("Exception thrown in awaitResult: ", e)
+        case NonFatal(t) =>
+          // Wrap and re-throw so that this thread's stacktrace appears to the user.
+          throw new Exception("Exception thrown in awaitResult: ", t)
+      }
     } catch {
       case e: InterruptedException =>
         try {
@@ -151,9 +161,13 @@ private[redshift] class JDBCWrapper {
    * @throws SQLException if the table contains an unsupported type.
    */
   def resolveTable(conn: Connection, table: String): StructType = {
-    val rs = executeQueryInterruptibly(conn.prepareStatement(s"SELECT * FROM $table WHERE 1=0"))
+    // It's important to leave the `LIMIT 1` clause in order to limit the work of the query in case
+    // the underlying JDBC driver implementation implements PreparedStatement.getMetaData() by
+    // executing the query. It looks like the standard Redshift and Postgres JDBC drivers don't do
+    // this but we leave the LIMIT condition here as a safety-net to guard against perf regressions.
+    val ps = conn.prepareStatement(s"SELECT * FROM $table LIMIT 1")
     try {
-      val rsmd = rs.getMetaData
+      val rsmd = executeInterruptibly(ps, _.getMetaData)
       val ncols = rsmd.getColumnCount
       val fields = new Array[StructField](ncols)
       var i = 0
@@ -163,14 +177,16 @@ private[redshift] class JDBCWrapper {
         val fieldSize = rsmd.getPrecision(i + 1)
         val fieldScale = rsmd.getScale(i + 1)
         val isSigned = rsmd.isSigned(i + 1)
-        val nullable = true // rsmd.isNullable(i + 1) != ResultSetMetaData.columnNoNulls
+
+        val nullable = true //rsmd.isNullable(i + 1) != ResultSetMetaData.columnNoNulls
+
         val columnType = getCatalystType(dataType, fieldSize, fieldScale, isSigned)
         fields(i) = StructField(columnName, columnType, nullable)
         i = i + 1
       }
       new StructType(fields)
     } finally {
-      rs.close()
+      ps.close()
     }
   }
 
@@ -267,7 +283,8 @@ private[redshift] class JDBCWrapper {
     // Somewhat hacky, but there isn't a good way to identify whether a table exists for all
     // SQL database systems, considering "table" could also include the database name.
     Try {
-      executeQueryInterruptibly(conn.prepareStatement(s"SELECT 1 FROM $table LIMIT 1")).next()
+      val stmt = conn.prepareStatement(s"SELECT 1 FROM $table LIMIT 1")
+      executeInterruptibly(stmt, _.getMetaData).getColumnCount
     }.isSuccess
   }
 
